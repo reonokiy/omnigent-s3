@@ -1,0 +1,164 @@
+name: Follow stable Omnigent releases
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: Rebuild the current stable version even when it is unchanged
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: update-upstream
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/omnigent-s3
+  UPSTREAM_REPOSITORY: omnigent-ai/omnigent
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Discover latest stable release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.force_rebuild }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq .tag_name)"
+          current="$(<.upstream-version)"
+          if [[ ! "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Refusing non-stable upstream tag: $latest" >&2
+            exit 1
+          fi
+          newest="$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)"
+          if [[ "$newest" != "$latest" ]]; then
+            echo "Refusing to downgrade from $current to $latest" >&2
+            exit 1
+          fi
+          needs_update=false
+          if [[ "$latest" != "$current" ]]; then
+            needs_update=true
+          fi
+          should_build="$needs_update"
+          if [[ "$FORCE_REBUILD" == "true" ]]; then
+            should_build=true
+          fi
+          {
+            echo "latest=$latest"
+            echo "current=$current"
+            echo "needs_update=$needs_update"
+            echo "should_build=$should_build"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
+
+      - name: Set up Buildx
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Fetch and generate pinned build inputs
+        if: steps.release.outputs.should_build == 'true'
+        id: generate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE: ${{ steps.release.outputs.latest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${UPSTREAM_REPOSITORY}/contents/pyproject.toml?ref=${RELEASE}" \
+            > "$RUNNER_TEMP/pyproject.toml"
+          gh api -H 'Accept: application/vnd.github.raw+json' \
+            "repos/${UPSTREAM_REPOSITORY}/contents/uv.lock?ref=${RELEASE}" \
+            > "$RUNNER_TEMP/uv.lock"
+          base_image="ghcr.io/omnigent-ai/omnigent-server:${RELEASE}"
+          digest="$(docker buildx imagetools inspect "$base_image" | awk '$1 == "Digest:" { print $2; exit }')"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve a valid digest for $base_image" >&2
+            exit 1
+          fi
+          python3 scripts/update_upstream.py \
+            --release "$RELEASE" \
+            --digest "$digest" \
+            --pyproject "$RUNNER_TEMP/pyproject.toml" \
+            --lock "$RUNNER_TEMP/uv.lock"
+          image_version="$(<.image-version)"
+          echo "image_version=$image_version" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare generated source commit
+        if: steps.release.outputs.should_build == 'true'
+        id: commit
+        env:
+          NEEDS_UPDATE: ${{ steps.release.outputs.needs_update }}
+          RELEASE: ${{ steps.release.outputs.latest }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$NEEDS_UPDATE" == "true" ]]; then
+            git diff --check
+            git config user.name github-actions[bot]
+            git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            git add .image-version .upstream-version Dockerfile requirements-s3.txt
+            git commit -m "Follow Omnigent ${RELEASE}"
+          elif ! git diff --quiet -- .image-version .upstream-version Dockerfile requirements-s3.txt; then
+            echo "Generator output drifted for unchanged release $RELEASE" >&2
+            git diff -- .image-version .upstream-version Dockerfile requirements-s3.txt
+            exit 1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        if: steps.release.outputs.should_build == 'true'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish stable update
+        if: steps.release.outputs.should_build == 'true'
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.generate.outputs.image_version }}
+            ${{ env.IMAGE_NAME }}:sha-${{ steps.commit.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Push generated source update
+        if: steps.release.outputs.needs_update == 'true'
+        run: git push origin HEAD:main
+
+      - name: Record result
+        env:
+          CURRENT: ${{ steps.release.outputs.current }}
+          LATEST: ${{ steps.release.outputs.latest }}
+          SHOULD_BUILD: ${{ steps.release.outputs.should_build }}
+          IMAGE_VERSION: ${{ steps.generate.outputs.image_version }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          if [[ "$SHOULD_BUILD" == "true" ]]; then
+            printf 'Published `%s:%s@%s`\n' "$IMAGE_NAME" "$IMAGE_VERSION" "$IMAGE_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf 'No update: current `%s`, latest stable upstream `%s`.\n' "$CURRENT" "$LATEST" >> "$GITHUB_STEP_SUMMARY"
+          fi

@@ -1,20 +1,17 @@
 # omnigent-s3
 
-Private build repository for a minimal Omnigent server image with the optional
+Build repository for a minimal Omnigent server image with the optional
 S3 artifact-store dependencies installed.
 
 ## Supply-chain boundary
 
-The image is derived from the official multi-platform Omnigent v0.11.0 server
-image, pinned by digest:
-
-```text
-ghcr.io/omnigent-ai/omnigent-server:v0.11.0@sha256:4e99225823eb7afbfa6159d1425cccf9cf07f2ce130b714a672ecdd15681c2cd
-```
+The image is derived from the official multi-platform Omnigent server image.
+`.upstream-version` records the tracked stable release, while the generated
+`Dockerfile` pins that release's base image by manifest digest.
 
 `requirements-s3.txt` pins `boto3`, `botocore`, and their transitive
-dependencies to the exact versions and wheel hashes recorded in the official
-Omnigent v0.11.0 `uv.lock`. Installation uses `--require-hashes` and accepts
+dependencies to the exact versions and wheel hashes recorded in the tracked
+release's official `uv.lock`. Installation uses `--require-hashes` and accepts
 binary wheels only.
 
 ## Published image
@@ -22,15 +19,16 @@ binary wheels only.
 A push to `main` or a manual workflow run publishes both architectures to:
 
 ```text
-ghcr.io/reonokiy/omnigent-s3:v0.11.0-s3.1
+ghcr.io/reonokiy/omnigent-s3:<value from .image-version>
 ghcr.io/reonokiy/omnigent-s3:sha-<git-commit>
 ```
 
 Deployments should pin the resulting manifest digest. Pull requests perform a
 build-only check and cannot publish. Publishing uses only the workflow's
 short-lived `GITHUB_TOKEN`; no registry credential is stored in this repository.
-The package is intended to remain private, so runtime consumers need a separate
-read-only GHCR credential delivered by their own secret-management boundary.
+Repository visibility and GHCR package visibility are independent. If the
+package is private, runtime consumers need a separate read-only GHCR credential
+delivered by their own secret-management boundary.
 
 ## Runtime configuration
 
@@ -50,9 +48,20 @@ it does not provision storage or deploy Omnigent.
 
 ## Updating
 
-For a new Omnigent release, review the upstream Dockerfile and lock file, update
-the base tag and digest, copy the exact S3 dependency versions and hashes, bump
-the derived tag, and review the resulting pull-request build before merging.
+The `Follow stable Omnigent releases` workflow runs daily at 06:17 UTC. It uses
+the official GitHub `releases/latest` endpoint, accepts only a `vX.Y.Z` tag, and
+refuses downgrades. Drafts and prereleases are not followed.
+
+For a new stable release, the workflow resolves the official server image to a
+manifest digest, reads that tag's `pyproject.toml` and `uv.lock`, computes the
+complete dependency closure of the `s3` extra, and regenerates the hash-pinned
+requirements and Dockerfile. It publishes the amd64/arm64 image first and only
+then pushes the generated source commit to `main`. A failed generation or build
+does not advance the tracked version. The workflow uses only its short-lived
+`GITHUB_TOKEN` with job-scoped `contents: write` and `packages: write`.
+
+A manual run can force a reproducibility check and rebuild of the current
+version. Generated files must not be edited by hand.
 
 Omnigent is developed by Databricks and contributors. This derivative is not
 an official Databricks image.
