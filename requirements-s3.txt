@@ -1,4 +1,4 @@
-# Generated from Omnigent v0.11.0's uv.lock by scripts/update_upstream.py.
+# Generated from Omnigent v0.12.0's uv.lock by scripts/update_upstream.py.
 # Do not edit manually.
 boto3==1.43.25 \
     --hash=sha256:e4e2515533a1593eb2302e9eda5baf4e1510abb219b41dd0db4696cc21bc5039
